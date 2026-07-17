@@ -491,6 +491,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn canonical_reasoning_alias_streams_reasoning_channel() {
+        // Newer vLLM-based providers use `delta.reasoning` (plain string)
+    // instead of `delta.reasoning_content`. The serde alias on
+    // ChatChunkDelta should pick it up, and the stream transform should
+    // emit it on the Reasoning channel just like `reasoning_content`.
+    let raw_json = r#"{"id":"chunk-1","object":"chat.completion.chunk","created":0,"model":"test-model","choices":[{"index":0,"delta":{"role":"assistant","reasoning":"thinking via canonical field"},"finish_reason":null}]}"#;
+        let reasoning_chunk: ChatCompletionChunk = serde_json::from_str(raw_json).unwrap();
+        // Verify the alias deserialized into reasoning_content.
+        assert_eq!(
+            reasoning_chunk.choices[0].delta.reasoning_content.as_deref(),
+            Some("thinking via canonical field")
+        );
+
+        let chunks: Vec<Result<ChatCompletionChunk, SamplingError>> = vec![
+            Ok(reasoning_chunk),
+            Ok(text_chunk("done")),
+            Ok(final_chunk(FinishReason::Stop)),
+        ];
+        let raw = stream::iter(chunks).boxed();
+        let events = collect(stream_chat_completions(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+        ))
+        .await;
+
+        let mut saw_reasoning = false;
+        for e in &events {
+            if let SamplingEvent::ChannelToken {
+                channel: SamplingChannel::Reasoning,
+                text,
+                ..
+            } = e
+            {
+                assert_eq!(text, "thinking via canonical field");
+                saw_reasoning = true;
+            }
+        }
+        assert!(saw_reasoning, "reasoning channel token must be emitted from canonical `reasoning` alias");
+
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                let r = response
+                    .reasoning_items()
+                    .next()
+                    .expect("reasoning sibling preserved");
+                let rs::SummaryPart::SummaryText(t) = &r.summary[0];
+                assert_eq!(t.text, "thinking via canonical field");
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn tool_call_stream_emits_deltas_and_assembles_final_call() {
         // First chunk has id + name + part of arguments.
         let chunk1 = make_chunk(vec![ChatChunkDelta {

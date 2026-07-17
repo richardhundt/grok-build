@@ -71,10 +71,13 @@ fn convert_line(
     }
 
     // (a) Legacy reasoning field on the assistant item.
-    // Tries `reasoning.text` first (chat-completions-style) then
-    // `reasoning.encrypted` (responses-API-style); the latter is opaque
-    // bytes so we surface it as a placeholder rather than dropping it
-    // silently. Real text wins if both are present.
+    // Tries `reasoning.text` first (chat-completions-style object form)
+    // then `reasoning.encrypted` (responses-API-style); the latter is
+    // opaque bytes so we surface it as a placeholder rather than dropping
+    // it silently. Real text wins if both are present.
+    // Also handles `reasoning` as a plain string (the newer canonical
+    // OpenAI/vLLM chat-completions shape) — in that case `r.get("text")`
+    // returns None, so we fall through to `r.as_str()`.
     let legacy_reasoning: Option<String> = if item_type == Some("assistant") {
         raw.get("reasoning").and_then(|r| {
             r.get("text")
@@ -85,6 +88,7 @@ fn convert_line(
                         .and_then(|t| t.as_str())
                         .map(|_| "[encrypted reasoning]".to_string())
                 })
+                .or_else(|| r.as_str().map(String::from))
         })
     } else {
         None
@@ -353,6 +357,19 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&a).unwrap()).unwrap();
         assert_eq!(v["reasoning_content"], "from legacy field");
         assert!(pending.is_empty());
+    }
+
+    /// `reasoning` as a plain string (the newer canonical OpenAI/vLLM
+    /// chat-completions shape) must be extracted — the code previously
+    /// only looked at `reasoning.text` (object form).
+    #[test]
+    fn test_legacy_reasoning_as_plain_string() {
+        let mut pending = Vec::new();
+        let a_line = r#"{"type":"assistant","content":"ok","reasoning":"plain string reasoning","tool_calls":[]}"#;
+        let a = convert_line(a_line, &mut pending).unwrap().unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&a).unwrap()).unwrap();
+        assert_eq!(v["reasoning_content"], "plain string reasoning");
     }
 
     #[test]

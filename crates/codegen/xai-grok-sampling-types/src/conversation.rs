@@ -1459,6 +1459,22 @@ pub fn upgrade_legacy_reasoning(
         siblings.push(ConversationItem::Reasoning(item));
     }
 
+    // Path D — v0 `ChatRequestMessage` with top-level `reasoning` as a
+    // plain string (the newer canonical OpenAI/vLLM chat-completions shape).
+    // Path B above handles `reasoning` as an *object* for v1 assistants;
+    // this handles the *string* form for v0 assistants, which is what
+    // vLLM-based providers emit. Only fires when Path C didn't already
+    // produce a sibling (the two fields are mutually exclusive in
+    // practice, but we guard against double siblings just in case).
+    if siblings.is_empty()
+        && is_v0_assistant
+        && let Some(rc) = obj.get("reasoning").and_then(|t| t.as_str())
+        && !rc.is_empty()
+        && let Some(item) = build_synthetic_reasoning(String::new(), Some(rc), None)
+    {
+        siblings.push(ConversationItem::Reasoning(item));
+    }
+
     siblings
 }
 
@@ -8693,6 +8709,45 @@ mod tests {
         };
         let rs::SummaryPart::SummaryText(s) = &r.summary[0];
         assert_eq!(s.text, "v0-style plain text reasoning");
+    }
+
+    #[test]
+    fn upgrade_legacy_reasoning_v0_canonical_reasoning_string() {
+        // v0 on disk with the newer canonical `reasoning` field name
+        // (plain string, as emitted by vLLM-based providers).
+        let raw = serde_json::json!({
+            "role": "assistant",
+            "content": "v0 answer",
+            "reasoning": "canonical reasoning field as plain string"
+        });
+        let mut seen = std::collections::HashSet::new();
+        let siblings = upgrade_legacy_reasoning(&raw, &mut seen);
+        assert_eq!(siblings.len(), 1);
+        let ConversationItem::Reasoning(r) = &siblings[0] else {
+            panic!("expected Reasoning sibling");
+        };
+        let rs::SummaryPart::SummaryText(s) = &r.summary[0];
+        assert_eq!(s.text, "canonical reasoning field as plain string");
+    }
+
+    #[test]
+    fn upgrade_legacy_reasoning_v0_reasoning_content_wins_over_reasoning_string() {
+        // When both fields are present, `reasoning_content` (Path C) fires
+        // first and returns, so `reasoning` (Path D) never gets a chance.
+        let raw = serde_json::json!({
+            "role": "assistant",
+            "content": "answer",
+            "reasoning_content": "from reasoning_content",
+            "reasoning": "from reasoning"
+        });
+        let mut seen = std::collections::HashSet::new();
+        let siblings = upgrade_legacy_reasoning(&raw, &mut seen);
+        assert_eq!(siblings.len(), 1);
+        let ConversationItem::Reasoning(r) = &siblings[0] else {
+            panic!("expected Reasoning sibling");
+        };
+        let rs::SummaryPart::SummaryText(s) = &r.summary[0];
+        assert_eq!(s.text, "from reasoning_content");
     }
 
     #[test]

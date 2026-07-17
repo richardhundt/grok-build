@@ -742,6 +742,81 @@ pub fn chat_completions_reasoning_then_tool_call_events(
     events
 }
 
+/// Canonical-field twin of [`chat_completions_reasoning_then_tool_call_events`]:
+/// identical structure but uses `delta.reasoning` (the newer canonical
+/// OpenAI/vLLM field name) instead of `delta.reasoning_content`. Use this
+/// to test that the serde alias on `ChatChunkDelta` picks up the canonical
+/// field.
+pub fn chat_completions_reasoning_then_tool_call_events_canonical(
+    reasoning: &str,
+    call_id: &str,
+    name: &str,
+    arguments: &str,
+    model: &str,
+) -> Vec<SseEvent> {
+    let mut events = Vec::new();
+    for word in reasoning.split_whitespace() {
+        events.push(SseEvent::data(
+            json!({
+                "id": "chatcmpl-test",
+                "object": "chat.completion.chunk",
+                "created": 1234567890,
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": { "reasoning": format!("{word} ") },
+                    "finish_reason": null
+                }]
+            })
+            .to_string(),
+        ));
+    }
+    events.push(SseEvent::data(
+        json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion.chunk",
+            "created": 1234567890,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": call_id,
+                        "type": "function",
+                        "function": { "name": name, "arguments": arguments }
+                    }]
+                },
+                "finish_reason": null
+            }]
+        })
+        .to_string(),
+    ));
+    events.push(SseEvent::data(
+        json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion.chunk",
+            "created": 1234567890,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 20,
+                "total_tokens": 30
+            }
+        })
+        .to_string(),
+    ));
+    events.push(SseEvent::data("[DONE]"));
+    events
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -984,6 +1059,57 @@ mod tests {
             .iter()
             .position(|v| !delta_at(v)["reasoning_content"].is_null())
             .expect("must stream reasoning_content deltas");
+        let tool_call = parsed
+            .iter()
+            .position(|v| !delta_at(v)["tool_calls"].is_null())
+            .expect("must stream a tool_calls delta");
+        assert!(
+            first_reasoning < tool_call,
+            "reasoning deltas must precede the tool call"
+        );
+        let call = delta_at(&parsed[tool_call])["tool_calls"][0].clone();
+        assert_eq!(call["id"].as_str(), Some("call_1"));
+        assert_eq!(call["function"]["name"].as_str(), Some("read_file"));
+        assert!(
+            parsed.iter().all(|v| delta_at(v)["content"]
+                .as_str()
+                .unwrap_or_default()
+                .is_empty()),
+            "a think-then-call turn must not stream visible content"
+        );
+        assert!(
+            parsed
+                .iter()
+                .any(|v| v["choices"][0]["finish_reason"] == "tool_calls"),
+            "the stream must finish with finish_reason tool_calls"
+        );
+    }
+
+    /// Shape guard for the canonical-field twin: `reasoning` (not
+    /// `reasoning_content`) deltas stream first, then exactly one
+    /// `tool_calls` delta, then `finish_reason: "tool_calls"`.
+    #[test]
+    fn chat_reasoning_then_tool_call_events_canonical_uses_reasoning_field() {
+        let events = chat_completions_reasoning_then_tool_call_events_canonical(
+            "alpha beta",
+            "call_1",
+            "read_file",
+            "{\"target_file\":\"a.rs\"}",
+            "m",
+        );
+        assert_eq!(events.last().map(|e| e.data.as_str()), Some("[DONE]"));
+
+        let parsed: Vec<serde_json::Value> = events
+            .iter()
+            .filter(|e| e.data != "[DONE]")
+            .map(|e| serde_json::from_str(&e.data).expect("each event is valid JSON"))
+            .collect();
+        let delta_at = |v: &serde_json::Value| v["choices"][0]["delta"].clone();
+
+        let first_reasoning = parsed
+            .iter()
+            .position(|v| !delta_at(v)["reasoning"].is_null())
+            .expect("must stream reasoning deltas");
         let tool_call = parsed
             .iter()
             .position(|v| !delta_at(v)["tool_calls"].is_null())

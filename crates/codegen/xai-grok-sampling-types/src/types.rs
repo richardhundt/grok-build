@@ -241,7 +241,7 @@ pub struct ChatRequestMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
     /// The reasoning/thinking content from the model (for models that support extended thinking)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, alias = "reasoning", skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
 }
 
@@ -492,7 +492,7 @@ pub struct ChatResponseMessage {
     pub role: Role,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "reasoning", skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCallResponse>,
@@ -637,6 +637,7 @@ pub struct ChatChunkDelta {
     pub role: Option<Role>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    #[serde(alias = "reasoning")]
     pub reasoning_content: Option<String>,
     /// Tool call deltas. Handles `null` in JSON as empty vec.
     #[serde(
@@ -1470,6 +1471,39 @@ mod tests {
         assert_eq!(delta.role, Some(Role::Assistant));
         assert_eq!(delta.content, Some("".to_string()));
         assert!(delta.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn chat_chunk_delta_deserializes_reasoning_alias() {
+        // Newer canonical OpenAI/vLLM shape: `delta.reasoning` (plain string)
+        let json = r#"{"reasoning":"thinking step by step","content":null}"#;
+        let delta: ChatChunkDelta = serde_json::from_str(json).unwrap();
+        assert_eq!(delta.reasoning_content.as_deref(), Some("thinking step by step"));
+    }
+
+    #[test]
+    fn chat_response_message_deserializes_reasoning_alias() {
+        let json = r#"{"role":"assistant","content":"answer","reasoning":"let me think"}"#;
+        let msg: ChatResponseMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.reasoning_content.as_deref(), Some("let me think"));
+    }
+
+    #[test]
+    fn chat_request_message_deserializes_reasoning_alias() {
+        let json = r#"{"role":"assistant","content":"answer","reasoning":"chain of thought"}"#;
+        let msg: ChatRequestMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.reasoning_content.as_deref(), Some("chain of thought"));
+    }
+
+    #[test]
+    fn chat_chunk_delta_reasoning_alias_works_alongside_reasoning_content() {
+        // When only the alias `reasoning` is present, it deserializes
+        // into `reasoning_content`. (When both field names are present
+        // simultaneously, serde treats it as a duplicate field error —
+        // but no real provider sends both, so we don't test that case.)
+        let json = r#"{"reasoning":"alias only","content":null}"#;
+        let delta: ChatChunkDelta = serde_json::from_str(json).unwrap();
+        assert_eq!(delta.reasoning_content.as_deref(), Some("alias only"));
     }
 
     /// Regression test: cloning `Box<dyn TraceContext>` must not infinitely recurse.

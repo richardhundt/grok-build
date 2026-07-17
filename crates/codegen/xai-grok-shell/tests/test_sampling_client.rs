@@ -387,6 +387,102 @@ async fn chat_completions_collect_synthesizes_reasoning_sibling() {
     );
 }
 
+/// Canonical-field path: a chat-completions stream using `delta.reasoning`
+/// (the newer canonical OpenAI/vLLM field name, not `reasoning_content`)
+/// must be collected into a sibling `ConversationItem::Reasoning` just
+/// like the legacy `reasoning_content` path. This exercises the serde
+/// alias end-to-end through `conversation_collect`.
+#[tokio::test]
+async fn chat_completions_collect_synthesizes_reasoning_sibling_from_canonical_field() {
+    let mut events = Vec::new();
+
+    // Reasoning chunks using the canonical `reasoning` field name
+    for word in "Let me think about this".split_whitespace() {
+        let chunk = json!({
+            "id": "chatcmpl-test123",
+            "object": "chat.completion.chunk",
+            "created": 1234567890,
+            "model": "grok-test",
+            "choices": [{
+                "index": 0,
+                "delta": { "reasoning": format!("{} ", word) },
+                "finish_reason": null
+            }]
+        });
+        events.push(SseEvent::data(chunk.to_string()));
+    }
+
+    // Content chunks
+    for word in "The answer is 42".split_whitespace() {
+        let chunk = json!({
+            "id": "chatcmpl-test123",
+            "object": "chat.completion.chunk",
+            "created": 1234567890,
+            "model": "grok-test",
+            "choices": [{
+                "index": 0,
+                "delta": { "content": format!("{} ", word) },
+                "finish_reason": null
+            }]
+        });
+        events.push(SseEvent::data(chunk.to_string()));
+    }
+
+    // Final chunk
+    let final_chunk = json!({
+        "id": "chatcmpl-test123",
+        "object": "chat.completion.chunk",
+        "created": 1234567890,
+        "model": "grok-test",
+        "choices": [{
+            "index": 0,
+            "delta": {},
+            "finish_reason": "stop"
+        }],
+        "usage": { "prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30 }
+    });
+    events.push(SseEvent::data(final_chunk.to_string()));
+    events.push(SseEvent::data("[DONE]"));
+
+    let server = MockInferenceServer::start().await.unwrap();
+    server.enqueue_response("/v1/chat/completions", ScriptedResponse::sse(events));
+
+    let client = create_test_client(&server.url(), ApiBackend::ChatCompletions);
+    let request = ConversationRequest::from_items(vec![ConversationItem::user(
+        "What is the meaning of life?",
+    )]);
+
+    let response = client.conversation_collect(request).await.unwrap();
+
+    // Items must be exactly [Reasoning, Assistant] — the sibling shape.
+    assert!(
+        matches!(
+            response.items.as_slice(),
+            [ConversationItem::Reasoning(_), ConversationItem::Assistant(_)]
+        ),
+        "expected [Reasoning, Assistant] from canonical `reasoning` field, got {:?}",
+        response.items
+    );
+
+    let reasoning = response
+        .reasoning_items()
+        .next()
+        .expect("a reasoning sibling must be synthesized from the canonical `reasoning` field");
+    let rs::SummaryPart::SummaryText(summary) = &reasoning.summary[0];
+    assert!(
+        summary.text.contains("Let me think"),
+        "reasoning sibling should carry the streamed `reasoning` field text, got: {:?}",
+        summary.text
+    );
+
+    let assistant = response.assistant().expect("assistant item present");
+    assert!(
+        assistant.content.contains("42"),
+        "assistant content should carry the streamed text, got: {:?}",
+        assistant.content
+    );
+}
+
 /// Upgrade path: a legacy chat-completions session on disk —
 /// an assistant carrying inline `reasoning: {text}` — must, when loaded,
 /// reconstruct a sibling Reasoning item, which then folds into
